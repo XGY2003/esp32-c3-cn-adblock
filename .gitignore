@@ -1,0 +1,26 @@
+# PlatformIO build output
+.pio/
+.vscode/
+
+# macOS metadata
+.DS_Store
+._*
+
+# VS Code workspace file
+*.code-workspace
+
+# Generated blocklist (build it with tools/build_blocklist.py)
+data/blocklist.bin
+
+# WiFi credentials (copy src/secrets.example.h -> src/secrets.h)
+src/secrets.h
+
+# Backups / scratch
+*.bak
+
+# Local build runtime, generated credentials, and reports
+work/
+ACCESS.local.txt
+__pycache__/
+*.pyc
+dist/

@@ -1,0 +1,125 @@
+name: Build China DNS rules
+
+on:
+  schedule:
+    # 04:20 Asia/Shanghai. Scheduled workflows run from the default branch.
+    - cron: '20 20 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - tools/build_cn_rules.py
+      - tools/test_build_cn_rules.py
+      - rules/allowlist.txt
+      - .github/workflows/china-rules.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: china-rules-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test parser, whitelist, format, and failure handling
+        run: python -m unittest discover -s tools -p 'test_build_cn_rules.py' -v
+      - name: Build and validate the single anti-AD source
+        run: |
+          python tools/build_cn_rules.py --output-dir dist
+          cp LICENSES/anti-AD-MIT.txt dist/anti-AD-MIT.txt
+      - name: Preserve reviewable build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-rules-${{ github.run_id }}
+          path: |
+            dist/blocklist.bin
+            dist/blocklist.bin.sha256
+            dist/manifest.json
+            dist/anti-AD-MIT.txt
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish to optional domestic COS or S3-compatible storage
+        if: ${{ vars.S3_ENDPOINT != '' }}
+        env:
+          S3_ENDPOINT: ${{ vars.S3_ENDPOINT }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+          S3_PREFIX: ${{ vars.S3_PREFIX }}
+          S3_PUBLIC_BASE: ${{ vars.S3_PUBLIC_BASE }}
+          AWS_DEFAULT_REGION: ${{ vars.S3_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+          AWS_RESPONSE_CHECKSUM_VALIDATION: when_required
+          AWS_EC2_METADATA_DISABLED: 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${S3_BUCKET:?Set S3_BUCKET (COS includes the numeric APPID)}"
+          : "${AWS_DEFAULT_REGION:?Set S3_REGION}"
+          : "${AWS_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID secret}"
+          : "${AWS_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY secret}"
+          : "${S3_PUBLIC_BASE:?Set the HTTPS public directory without trailing slash}"
+          case "$S3_ENDPOINT" in https://*) ;; *) echo 'S3_ENDPOINT must use HTTPS'; exit 1;; esac
+          case "$S3_PUBLIC_BASE" in https://*) ;; *) echo 'S3_PUBLIC_BASE must use HTTPS'; exit 1;; esac
+          if ! command -v aws >/dev/null 2>&1; then python -m pip install 'awscli==1.46.1'; fi
+          aws configure set default.s3.addressing_style virtual
+          prefix="${S3_PREFIX#/}"; prefix="${prefix%/}"
+          if [ -n "$prefix" ]; then prefix="$prefix/"; fi
+          # The checksum is the final publication marker. A racing client keeps
+          # its previous table on any mismatch; these uploads are not atomic.
+          for asset in anti-AD-MIT.txt blocklist.bin manifest.json blocklist.bin.sha256; do
+            content_type=application/octet-stream
+            if [ "$asset" = manifest.json ]; then content_type=application/json; fi
+            if [ "$asset" = blocklist.bin.sha256 ]; then content_type=text/plain; fi
+            if [ "$asset" = anti-AD-MIT.txt ]; then content_type=text/plain; fi
+            aws s3 cp "dist/$asset" "s3://$S3_BUCKET/$prefix$asset" \
+              --endpoint-url "$S3_ENDPOINT" --region "$AWS_DEFAULT_REGION" \
+              --cache-control 'no-cache, no-transform' --content-type "$content_type" \
+              --only-show-errors --no-progress
+          done
+          python tools/check_update_url.py "${S3_PUBLIC_BASE%/}/blocklist.bin"
+          echo "Domestic update URL: ${S3_PUBLIC_BASE%/}/blocklist.bin" >> "$GITHUB_STEP_SUMMARY"
+      - name: Create the stable release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          if ! gh release view cn-rules >/dev/null 2>&1; then
+            gh release create cn-rules \
+              --target "$GITHUB_SHA" \
+              --title "China DNS rules (daily anti-AD)" \
+              --notes "Daily ESP32-C3 40-bit DNS hash table. See manifest.json for source, count, and whitelist effects. Fixed release assets update separately: firmware must verify blocklist.bin.sha256 and retain its previous table on mismatch."
+          fi
+      - name: Publish the binary and manifest, then checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          # Release asset replacement is not transactional. A device that fetches
+          # during this window must retry later and keep its last verified table.
+          gh release upload cn-rules dist/blocklist.bin --clobber
+          gh release upload cn-rules dist/manifest.json --clobber
+          gh release upload cn-rules dist/anti-AD-MIT.txt --clobber
+          gh release upload cn-rules dist/blocklist.bin.sha256 --clobber
+      - name: Show deployment URL and rule summary
+        env:
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          echo "Update URL: https://github.com/$GH_REPO/releases/download/cn-rules/blocklist.bin" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Companion checksum: append .sha256 to the complete update URL.' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat dist/manifest.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

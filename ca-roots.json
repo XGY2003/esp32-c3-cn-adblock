@@ -1,0 +1,41 @@
+{
+  "bundle": "certifi",
+  "version": "2026.7.22",
+  "roots": [
+    {
+      "name": "DigiCert Global Root G2",
+      "sha256": "cb3ccbb76031e5e0138f8dd39a23f9de47ffc35e43c1144cea27d46a5ab1cb5f",
+      "expires": "2038-01-15T12:00:00+00:00"
+    },
+    {
+      "name": "USERTrust RSA Certification Authority",
+      "sha256": "e793c9b02fd8aa13e21c31228accb08119643b749c898964b1746d46c3d4cbd2",
+      "expires": "2038-01-18T23:59:59+00:00"
+    },
+    {
+      "name": "USERTrust ECC Certification Authority",
+      "sha256": "4ff460d54b9c86dabfbcfc5712e0400d2bed3fbc4d4fbdaa86e06adcd2a9ad7a",
+      "expires": "2038-01-18T23:59:59+00:00"
+    },
+    {
+      "name": "ISRG Root X1",
+      "sha256": "96bcec06264976f37460779acf28c5a7cfe8a3c0aae11a8ffcee05c0bddf08c6",
+      "expires": "2035-06-04T11:04:38+00:00"
+    },
+    {
+      "name": "ISRG Root X2",
+      "sha256": "69729b8e15a86efc177a57afb7171dfc64add28c2fca8cf1507e34453ccb1470",
+      "expires": "2040-09-17T16:00:00+00:00"
+    },
+    {
+      "name": "GTS Root R1",
+      "sha256": "d947432abde7b7fa90fc2e6b59101b1280e0e1c7e4e40fa3c6887fff57a7f4cf",
+      "expires": "2036-06-22T00:00:00+00:00"
+    },
+    {
+      "name": "GTS Root R4",
+      "sha256": "349dfa4058c5e263123b398ae795573c4e1313c83fe68f93556cd5e8031b3c7d",
+      "expires": "2036-06-22T00:00:00+00:00"
+    }
+  ]
+}

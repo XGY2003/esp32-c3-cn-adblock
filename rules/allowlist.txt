@@ -1,0 +1,12 @@
+# One plain ASCII domain per line. Empty lines and full-line # / ! comments work.
+# Start empty; add only domains that a real device needs to access.
+# Use punycode for internationalized names. Do not use URLs, IPs, wildcards,
+# inline comments, hosts-file entries, AdGuard/ABP syntax, or cosmetic rules.
+# A leading www. is removed, exactly as in the firmware.
+#
+# Hash-only DNS rules match parent domains. To allow login.example.com, the
+# builder also removes any blocked example.com ancestor, which can allow its
+# OTHER subdomains. An allow entry also removes block rules in its own subtree.
+# Review manifest.json -> allowlist.removed_blocked_ancestors after every edit.
+# Example (uncomment only if required):
+# login.example.com
