@@ -17,6 +17,9 @@
 #include <Preferences.h>       // NVS store for provisioned WiFi creds
 #include <time.h>
 #include <ctype.h>
+#include <atomic>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <esp_sntp.h>
 #include <esp_netif.h>
 #include <esp_wifi.h>
@@ -569,6 +572,35 @@ static bool isHttpsUrl(const String& url) {
   String authority = slash < 0 ? url.substring(8) : url.substring(8, slash);
   return authority.length() && authority.indexOf('@') < 0;
 }
+struct HttpGetJob {
+  HTTPClient* http = nullptr;
+  int code = 0;
+  std::atomic<bool> done{false};
+};
+static void runHttpGet(void* parameter) {
+  HttpGetJob* job = static_cast<HttpGetJob*>(parameter);
+  job->code = job->http->GET();
+  job->done.store(true, std::memory_order_release);
+  // The caller can release the job once done is published. Never touch it again.
+  vTaskDelete(nullptr);
+}
+static bool getWithDnsService(HTTPClient& http, int& code) {
+  HttpGetJob job; job.http = &http;
+  // ESP-IDF specifies task stack size in bytes. Only GET (DNS/TLS/headers)
+  // runs on this temporary worker; the caller retains all filesystem/state work.
+  if (xTaskCreate(runHttpGet, "rule-https", 16 * 1024, &job, 1, nullptr) != pdPASS) {
+    updateStatus = "HTTPS worker allocation failed"; return false;
+  }
+  while (!job.done.load(std::memory_order_acquire)) {
+    serviceUpdateDns();
+    delay(1);
+  }
+  // Do not abandon this stack job while GET is active. HTTPClient owns its
+  // configured connection/read timeouts; access resumes only after completion.
+  code = job.code;
+  delay(1);  // Let the worker finish deletion and the idle task reclaim its stack.
+  return true;
+}
 static bool openVerifiedHttps(HTTPClient& http, WiFiClientSecure& tls, String url) {
   tls.setCACert(UPDATE_ROOT_CA);
   tls.setHandshakeTimeout(8);
@@ -580,7 +612,16 @@ static bool openVerifiedHttps(HTTPClient& http, WiFiClientSecure& tls, String ur
   for (int redirects = 0; redirects <= 3; redirects++) {
     if (!isHttpsUrl(url)) { updateStatus = "HTTPS URL required (redirect rejected)"; return false; }
     if (!http.begin(tls, url)) { updateStatus = "HTTPS begin failed"; return false; }
-    int code = http.GET();
+    int code = 0;
+    if (!getWithDnsService(http, code)) { http.end(); return false; }
+    if (code < 0) {
+      char detail[100] = {};
+      int tlsError = tls.lastError(detail, sizeof(detail));
+      Serial.printf("[remote] HTTP %d, TLS %d: %s; free heap %u\n", code, tlsError, detail, ESP.getFreeHeap());
+      http.end();
+      updateStatus = "transport " + String(code) + ", TLS " + String(tlsError) + ": " + String(detail);
+      return false;
+    }
     if (code == HTTP_CODE_OK) {
       String transfer = http.header("Transfer-Encoding"), encoding = http.header("Content-Encoding");
       if (transfer.length() || (encoding.length() && !encoding.equalsIgnoreCase("identity"))) {
@@ -850,7 +891,11 @@ void setup() {
     prefs.begin("wifi", false); prefs.clear(); prefs.end(); delay(500); ESP.restart(); });
   web.on("/upload", HTTP_POST, handleUploadDone, handleUpload);      // blocklist OTA (auth inside handleUpload)
   web.on("/update", HTTP_POST, handleFwUpdateDone, handleFwUpload);  // firmware OTA (auth inside handleFwUpload)
-  web.on("/fetchnow", []() { if (!requireAuth()) return; fetchBlocklist(updateUrl); web.send(200, "text/plain", updateStatus); });
+  web.on("/fetchnow", []() {
+    if (!requireAuth()) return;
+    bool ok = fetchBlocklist(updateUrl);
+    web.send(ok ? 200 : 502, "text/plain", updateStatus);
+  });
   web.on("/setupdate", []() {
     if (!requireAuth()) return;
     String candidate = web.hasArg("u") ? web.arg("u") : updateUrl; candidate.trim();

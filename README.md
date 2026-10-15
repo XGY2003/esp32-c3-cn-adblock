@@ -41,7 +41,7 @@ python -m unittest discover -s tools -p 'test_*.py' -v
 - 只使用验证 CA 的 HTTPS；NTP 同步前不下载。原始订阅地址须为不带 query 的稳定 HTTPS URL；最多接受 3 次绝对 HTTPS 重定向。托管端须给出 Content-Length，禁用压缩和 chunked。
 - 默认 DNS 上游 `223.5.5.5`，备用 `119.29.29.29`。板子自己的 DNS 配置独立使用上游，避免 DHCP 分发板子自身地址造成循环。
 - 显式设置 WPA3 SAE PWE BOTH，提高与 H2E 网络的互通性。
-- 下载分块间处理 DNS；TLS 建连和响应头读取仍可能短时阻塞 DNS。
+- TLS 建连和响应头读取在临时任务中执行，等待期间及下载分块间继续处理 DNS。实际更新时的吞吐和延迟仍受 Wi-Fi、上游与设备负载影响。
 
 ## 白名单
 
