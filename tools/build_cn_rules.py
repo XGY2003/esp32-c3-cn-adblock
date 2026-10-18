@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Build a bounded China-focused DNS list for the ESP32-C3 firmware.
+"""Build bounded China-focused DNS lists for ESP32-C3 and ESP32-S3.
 
-Only anti-AD's official domains-only list is enabled. The raw GitHub URL is a
-fallback for the SAME list, never an additional list to merge. Output format:
+The default legacy profile retains anti-AD only and its 550000-byte C3 limit.
+The strong S3 profile requires BOTH anti-AD and Cats-Team AdRules (MosDNS format).
+Mirrors are fallbacks for the SAME list, never additional lists to merge. Format:
 strictly increasing unsigned 40-bit FNV-1a hashes, five little-endian bytes each.
 
 Firmware strips one leading ``www.`` and matches blocked parent domains. This
@@ -21,6 +22,7 @@ or a publication race and is not a separate publisher signature.
 Python 3.10+, standard library only. Run from any directory:
     python tools/build_cn_rules.py --output-dir data
     python tools/build_cn_rules.py --source saved-domains.txt --output-dir dist
+    python tools/build_cn_rules.py --profile strong --output-dir dist-s3
 """
 from __future__ import annotations
 
@@ -48,6 +50,12 @@ DEFAULT_SOURCES = (
     "https://anti-ad.net/domains.txt",
     "https://raw.githubusercontent.com/privacy-protection-tools/anti-AD/master/anti-ad-domains.txt",
 )
+# These HTTPS mirrors are linked by Cats-Team/AdRules' official README.
+ADRULES_SOURCES = (
+    "https://adrules.top/mosdns_adrules.txt",
+    "https://gp.adrules.top/mosdns_adrules.txt",
+    "https://raw.githubusercontent.com/Cats-Team/AdRules/main/mosdns_adrules.txt",
+)
 HASH_BYTES = 5
 HASH_MASK = (1 << (HASH_BYTES * 8)) - 1
 FNV_OFFSET = 0xCBF29CE484222325
@@ -56,6 +64,13 @@ U64_MASK = (1 << 64) - 1
 MIN_HASHES = 10_000
 MAX_HASHES = 110_000
 MAX_OUTPUT_BYTES = 550_000
+STRONG_MAX_HASHES = 300_000
+STRONG_MAX_OUTPUT_BYTES = 1_500_000
+MIN_ADRULES_DOMAINS = 100_000
+CAPACITY_PROFILES = {
+    "legacy": (MAX_HASHES, MAX_OUTPUT_BYTES),
+    "strong": (STRONG_MAX_HASHES, STRONG_MAX_OUTPUT_BYTES),
+}
 MAX_SOURCE_BYTES = 8 * 1024 * 1024
 DOWNLOAD_TIMEOUT_SECONDS = 30
 DOWNLOAD_DEADLINE_SECONDS = 120
@@ -75,6 +90,7 @@ class ParsedDomains:
     comment_lines: int
     empty_lines: int
     metadata: dict[str, str]
+    source_body: bytes = b""
 
 
 def normalize_domain(value: str) -> str | None:
@@ -106,7 +122,10 @@ def normalize_domain(value: str) -> str | None:
     return domain if "." in domain else None
 
 
-def parse_domains(body: bytes, require_metadata: bool = False) -> ParsedDomains:
+def parse_domains(body: bytes, require_metadata: bool = False, *,
+                  source_format: str = "domains", strict: bool = False) -> ParsedDomains:
+    if source_format not in {"domains", "mosdns"}:
+        raise BuildError(f"unsupported source format {source_format}")
     if len(body) > MAX_SOURCE_BYTES:
         raise BuildError(f"source exceeds {MAX_SOURCE_BYTES} bytes")
     try:
@@ -115,6 +134,8 @@ def parse_domains(body: bytes, require_metadata: bool = False) -> ParsedDomains:
         raise BuildError("source is not valid UTF-8 text") from exc
     if "<" in text or ">" in text or "\x00" in text:
         raise BuildError("source contains HTML/XML markup or a NUL byte")
+    if strict and not text.endswith("\n"):
+        raise BuildError("strict source must end with a newline; possibly truncated")
     domains: set[str] = set()
     valid = invalid = comments = empty = 0
     metadata: dict[str, str] = {}
@@ -129,7 +150,12 @@ def parse_domains(body: bytes, require_metadata: bool = False) -> ParsedDomains:
                 if key in {"TITLE", "VER", "URL", "TOTAL_LINES"}:
                     metadata[key] = value[:512]
         else:
-            domain = normalize_domain(line)
+            # Only MosDNS domain: suffix rules have the firmware's parent-match
+            # semantics. Reject full:, regexp:, hosts, ABP, paths and modifiers.
+            value = line
+            if source_format == "mosdns":
+                value = line[7:] if line.startswith("domain:") else ""
+            domain = normalize_domain(value)
             if domain is None:
                 invalid += 1
             else:
@@ -137,6 +163,8 @@ def parse_domains(body: bytes, require_metadata: bool = False) -> ParsedDomains:
                 domains.add(domain)
     if not domains:
         raise BuildError("source contains no valid domain rules")
+    if strict and invalid:
+        raise BuildError(f"source contains {invalid} invalid {source_format} rule lines")
     if require_metadata:
         if metadata.get("TITLE") != "anti-AD":
             raise BuildError("official anti-AD source is missing its exact TITLE=anti-AD header")
@@ -147,7 +175,7 @@ def parse_domains(body: bytes, require_metadata: bool = False) -> ParsedDomains:
             raise BuildError(f"official anti-AD TOTAL_LINES={declared_count} does not match {valid} valid domain lines")
         if invalid:
             raise BuildError(f"official anti-AD source contains {invalid} invalid domain lines")
-    return ParsedDomains(domains, valid, invalid, comments, empty, metadata)
+    return ParsedDomains(domains, valid, invalid, comments, empty, metadata, body)
 
 
 def parent_domains(domain: str) -> Iterable[str]:
@@ -213,14 +241,23 @@ def fnv40(domain: str) -> int:
     return value & HASH_MASK
 
 
-def encode_domains(domains: set[str], allowed: set[str], min_hashes: int) -> tuple[bytes, int]:
+def profile_limits(profile: str) -> tuple[int, int]:
+    try:
+        return CAPACITY_PROFILES[profile]
+    except KeyError as exc:
+        raise BuildError(f"unknown build profile {profile}") from exc
+
+
+def encode_domains(domains: set[str], allowed: set[str], min_hashes: int,
+                   profile: str = "legacy") -> tuple[bytes, int]:
+    max_hashes, max_bytes = profile_limits(profile)
     hashes = {fnv40(domain) for domain in domains}
-    if not MIN_HASHES <= min_hashes <= MAX_HASHES:
-        raise BuildError(f"min_hashes must be between {MIN_HASHES} and {MAX_HASHES}")
+    if not MIN_HASHES <= min_hashes <= max_hashes:
+        raise BuildError(f"min_hashes must be between {MIN_HASHES} and {max_hashes}")
     if len(hashes) < min_hashes:
         raise BuildError(f"only {len(hashes)} hashes; minimum is {min_hashes}")
-    if len(hashes) > MAX_HASHES or len(hashes) * HASH_BYTES > MAX_OUTPUT_BYTES:
-        raise BuildError(f"{len(hashes)} hashes exceed the {MAX_HASHES}-hash / {MAX_OUTPUT_BYTES}-byte capacity; refusing to truncate")
+    if len(hashes) > max_hashes or len(hashes) * HASH_BYTES > max_bytes:
+        raise BuildError(f"{len(hashes)} hashes exceed the {max_hashes}-hash / {max_bytes}-byte capacity; refusing to truncate")
     for domain in allowed:
         if any(fnv40(parent) in hashes for parent in parent_domains(domain)):
             raise BuildError(f"40-bit hash collision prevents allowing {domain}; refusing output")
@@ -287,7 +324,8 @@ def download_source(source: str) -> tuple[bytes, str]:
         raise BuildError(f"download failed for {source}: {exc}") from exc
 
 
-def select_source(sources: Iterable[str], min_hashes: int) -> tuple[ParsedDomains, dict, list[dict]]:
+def select_source(sources: Iterable[str], min_hashes: int, *, source_format: str = "domains",
+                  strict: bool = False) -> tuple[ParsedDomains, dict, list[dict]]:
     attempts: list[dict] = []
     for source in sources:
         try:
@@ -296,14 +334,17 @@ def select_source(sources: Iterable[str], min_hashes: int) -> tuple[ParsedDomain
             # so an HTTP 200 response with a truncated body cannot replace the
             # old table merely because its remaining portion exceeds 10k rules.
             # Custom/local sources remain usable without anti-AD-specific headers.
-            parsed = parse_domains(body, require_metadata=source in DEFAULT_SOURCES)
+            parsed = parse_domains(body, require_metadata=source in DEFAULT_SOURCES,
+                                   source_format=source_format, strict=strict)
             if len(parsed.domains) < min_hashes:
                 raise BuildError(f"source has only {len(parsed.domains)} unique domains; minimum is {min_hashes}")
             return parsed, {
                 "requested": source,
                 "resolved": resolved,
+                "retrieved_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "sha256": hashlib.sha256(body).hexdigest(),
                 "bytes": len(body),
+                "format": source_format,
                 "upstream_metadata": parsed.metadata,
                 "valid_lines": parsed.valid_lines,
                 "invalid_lines_rejected": parsed.invalid_lines,
@@ -334,17 +375,50 @@ def publish_artifacts(output_dir: Path, artifacts: dict[str, bytes]) -> None:
 
 
 def build(output_dir: Path, allowlist_path: Path, sources: Iterable[str] = DEFAULT_SOURCES,
-          min_hashes: int = MIN_HASHES) -> dict:
-    if not MIN_HASHES <= min_hashes <= MAX_HASHES:
-        raise BuildError(f"minimum must be between {MIN_HASHES} and {MAX_HASHES}")
+          min_hashes: int = MIN_HASHES, *, profile: str = "legacy",
+          adrules_sources: Iterable[str] | None = None) -> dict:
+    max_hashes, max_bytes = profile_limits(profile)
+    if not MIN_HASHES <= min_hashes <= max_hashes:
+        raise BuildError(f"minimum must be between {MIN_HASHES} and {max_hashes}")
+    if profile != "strong" and adrules_sources is not None:
+        raise BuildError("AdRules sources require --profile strong")
     allowed, allowlist_sha = read_allowlist(allowlist_path)
-    parsed, source, failed_attempts = select_source(sources, min_hashes)
-    filtered, allow_report = apply_allowlist(parsed.domains, allowed)
+    parsed, source, failed_attempts = select_source(sources, min_hashes, strict=profile == "strong")
+    source.update(name="anti-AD", license="MIT", license_file="anti-AD-MIT.txt",
+                  upstream="https://github.com/privacy-protection-tools/anti-AD")
+    source_reports = [source]
+    merged = set(parsed.domains)
+    extra_artifacts: dict[str, bytes] = {}
+    if profile == "strong":
+        # A failure of either required list aborts before publish_artifacts.
+        # Never publish an anti-AD-only replacement under the S3 release tag.
+        adrules, ad_source, failures = select_source(
+            ADRULES_SOURCES if adrules_sources is None else adrules_sources,
+            MIN_ADRULES_DOMAINS, source_format="mosdns", strict=True,
+        )
+        ad_source.update(name="Cats-Team/AdRules", license="mixed upstream licenses; not 0BSD",
+                         license_file="AdRules-NOTICE.md",
+                         upstream="https://github.com/Cats-Team/AdRules",
+                         licensing_source="https://github.com/Cats-Team/AdRules/blob/script/Source.md")
+        source_reports.append(ad_source)
+        failed_attempts.extend(failures)
+        merged.update(adrules.domains)
+        extra_artifacts = {
+            "source-anti-ad-domains.txt": parsed.source_body,
+            "source-adrules-mosdns.txt": adrules.source_body,
+        }
+        for name in ("anti-AD-MIT.txt", "AdRules-NOTICE.md", "AdRules-UPSTREAM-SOURCES.md",
+                     "AdRules-UPSTREAM-README.md"):
+            extra_artifacts[name] = (PROJECT_ROOT / "LICENSES" / name).read_bytes()
+    filtered, allow_report = apply_allowlist(merged, allowed)
     compact = remove_redundant_children(filtered)
-    blob, collisions = encode_domains(compact, allowed, min_hashes)
+    blob, collisions = encode_domains(compact, allowed, min_hashes, profile)
     checksum = hashlib.sha256(blob).hexdigest()
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "profile": profile,
+        "builder_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "required_sources": [item["name"] for item in source_reports],
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "format": {
             "algorithm": "FNV-1a-64 truncated to low 40 bits",
@@ -354,19 +428,29 @@ def build(output_dir: Path, allowlist_path: Path, sources: Iterable[str] = DEFAU
             "normalization": "ASCII lowercase; strip one leading www.; match parent domains",
         },
         "source": source,
+        "sources": source_reports,
         "failed_source_attempts": failed_attempts,
         "allowlist": {**allow_report, "sha256": allowlist_sha},
         "rules": {
+            "merged_unique_domains": len(merged),
             "after_allowlist": len(filtered),
             "redundant_children_removed": len(filtered) - len(compact),
             "retained_domains": len(compact),
             "hash_collisions": collisions,
             "hashes": len(blob) // HASH_BYTES,
         },
-        "capacity": {"min_hashes": min_hashes, "max_hashes": MAX_HASHES, "max_bytes": MAX_OUTPUT_BYTES},
+        "capacity": {"min_hashes": min_hashes, "max_hashes": max_hashes, "max_bytes": max_bytes},
         "artifacts": {"blocklist.bin": {"bytes": len(blob), "sha256": checksum}},
     }
+    if profile == "strong":
+        extra_artifacts["domains.txt"] = ("\n".join(sorted(compact)) + "\n").encode("ascii")
+        extra_artifacts["allowlist.txt"] = ("\n".join(sorted(allowed)) + "\n").encode("ascii")
+    manifest["artifacts"].update({
+        name: {"bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+        for name, content in extra_artifacts.items()
+    })
     artifacts = {
+        **extra_artifacts,
         "blocklist.bin": blob,
         "blocklist.bin.sha256": (checksum + "\n").encode("ascii"),
         "manifest.json": (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
@@ -379,21 +463,35 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data")
     parser.add_argument("--allowlist", type=Path, default=PROJECT_ROOT / "rules" / "allowlist.txt")
+    parser.add_argument("--profile", choices=sorted(CAPACITY_PROFILES), default="legacy",
+                        help="legacy: anti-AD/C3; strong: anti-AD + AdRules/S3")
     parser.add_argument("--source", help="one local domains file or HTTPS source; overrides the default anti-AD source pair")
     parser.add_argument("--fallback-source", action="append", default=[], help="same-list fallback for --source; never merged")
+    parser.add_argument("--adrules-source", help="override strong profile's AdRules MosDNS source")
+    parser.add_argument("--adrules-fallback-source", action="append", default=[],
+                        help="same AdRules MosDNS list fallback; never merged")
     parser.add_argument("--min-hashes", type=int, default=MIN_HASHES, help=f"minimum accepted final hashes (cannot be below {MIN_HASHES})")
     args = parser.parse_args(argv)
     if args.fallback_source and not args.source:
         parser.error("--fallback-source requires --source")
+    if args.adrules_fallback_source and not args.adrules_source:
+        parser.error("--adrules-fallback-source requires --adrules-source")
+    if (args.adrules_source or args.adrules_fallback_source) and args.profile != "strong":
+        parser.error("AdRules options require --profile strong")
     sources = (args.source, *args.fallback_source) if args.source else DEFAULT_SOURCES
+    adrules_sources = ((args.adrules_source, *args.adrules_fallback_source)
+                      if args.adrules_source else None)
     try:
-        manifest = build(args.output_dir, args.allowlist, sources, args.min_hashes)
+        manifest = build(args.output_dir, args.allowlist, sources, args.min_hashes,
+                         profile=args.profile, adrules_sources=adrules_sources)
     except (BuildError, OSError) as exc:
         print(f"BUILD FAILED: {exc}", file=sys.stderr)
         return 1
-    print(f"source: {manifest['source']['resolved']}")
-    print(f"source domains: {manifest['source']['valid_lines']:,} valid lines, "
-          f"{manifest['source']['invalid_lines_rejected']:,} rejected lines")
+    print(f"profile: {manifest['profile']}")
+    for source in manifest["sources"]:
+        print(f"source: {source['name']}: {source['resolved']}")
+        print(f"source domains: {source['valid_lines']:,} valid lines, "
+              f"{source['invalid_lines_rejected']:,} rejected lines")
     print(f"rules: {manifest['rules']['hashes']:,} hashes; "
           f"{manifest['artifacts']['blocklist.bin']['bytes']:,} bytes; "
           f"{manifest['rules']['redundant_children_removed']:,} redundant children removed")

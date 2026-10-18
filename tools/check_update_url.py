@@ -3,6 +3,7 @@
 
 This runs on the computer or CI runner; it does not prove ESP32 connectivity.
 Usage: python tools/check_update_url.py https://your-host/rules/blocklist.bin
+S3: python tools/check_update_url.py --profile strong https://your-host/s3/blocklist.bin
 """
 from __future__ import annotations
 
@@ -14,7 +15,9 @@ import ssl
 import urllib.parse
 import urllib.request
 
-MAX_BYTES = 550_000
+from build_cn_rules import CAPACITY_PROFILES, profile_limits
+
+MAX_BYTES = profile_limits('legacy')[1]
 
 
 class HttpsRedirects(urllib.request.HTTPRedirectHandler):
@@ -26,7 +29,8 @@ class HttpsRedirects(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(request, fp, code, message, headers, new_url)
 
 
-def check(url: str) -> dict:
+def check(url: str, profile: str = 'legacy') -> dict:
+    maximum_bytes = profile_limits(profile)[1]
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != 'https' or not parsed.hostname or parsed.query or parsed.fragment or parsed.username:
         raise ValueError('Use a stable HTTPS URL without query, fragment, or user information')
@@ -54,7 +58,7 @@ def check(url: str) -> dict:
     checksum = download(url + '.sha256', 66).decode('ascii').rstrip('\r\n')
     if not re.fullmatch('[0-9a-fA-F]{64}', checksum):
         raise ValueError('Checksum must be one line of 64 hex digits')
-    data = download(url, MAX_BYTES)
+    data = download(url, maximum_bytes)
     if len(data) % 5:
         raise ValueError('Hash table is not a multiple of 5 bytes')
     values = [int.from_bytes(data[index:index + 5], 'little') for index in range(0, len(data), 5)]
@@ -63,14 +67,16 @@ def check(url: str) -> dict:
     actual = hashlib.sha256(data).hexdigest()
     if actual != checksum.lower():
         raise ValueError('SHA256 mismatch; retry after publication has completed')
-    return {'url': url, 'bytes': len(data), 'hashes': len(values), 'sha256': actual}
+    return {'url': url, 'profile': profile, 'bytes': len(data), 'hashes': len(values), 'sha256': actual}
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('url')
+    parser.add_argument('--profile', choices=sorted(CAPACITY_PROFILES), default='legacy',
+                        help='Use strong only for the expanded S3 firmware; default retains the C3 limit')
     arguments = parser.parse_args()
     try:
-        print(check(arguments.url))
+        print(check(arguments.url, arguments.profile))
     except Exception as error:
         parser.exit(1, f'Publication preflight failed: {error}\n')

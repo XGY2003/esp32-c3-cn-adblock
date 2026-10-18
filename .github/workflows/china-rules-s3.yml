@@ -1,0 +1,84 @@
+name: Build strong China DNS rules for S3
+
+on:
+  schedule:
+    # 04:35 Asia/Shanghai. Requires BOTH sources on every scheduled build.
+    - cron: '35 20 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - tools/build_cn_rules.py
+      - tools/test_build_cn_rules.py
+      - tools/check_update_url.py
+      - rules/allowlist.txt
+      - LICENSES/AdRules-*.md
+      - LICENSES/anti-AD-MIT.txt
+      - .github/workflows/china-rules-s3.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: china-rules-s3-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test both profiles and failed-source preservation
+        run: python -m unittest discover -s tools -p 'test_build_cn_rules.py' -v
+      - name: Merge anti-AD and AdRules with the strong S3 capacity
+        run: python tools/build_cn_rules.py --profile strong --output-dir dist-s3
+      - name: Preserve binary, readable rules, inputs and licensing
+        uses: actions/upload-artifact@v4
+        with:
+          name: china-rules-s3-${{ github.run_id }}
+          path: dist-s3/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Create the separate stable S3 release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! gh release view cn-rules-s3 >/dev/null 2>&1; then
+            gh release create cn-rules-s3 --target "$GITHUB_SHA" \
+              --title "Strong China DNS rules (S3: anti-AD + AdRules)" \
+              --notes "Daily merge of both required sources for the expanded S3 firmware. See manifest.json, domains.txt, original source snapshots and licensing notices. Requires up to 1500000 bytes of rule capacity; do not use with legacy C3 firmware. The companion SHA256 is published last; clients retain the old table on mismatch."
+          fi
+      - name: Publish all S3 artifacts, then the companion checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fixed release assets cannot be replaced as one transaction. Keep
+          # cn-rules untouched, and use the checksum as the final marker.
+          for asset in dist-s3/*; do
+            if [ "$(basename "$asset")" != blocklist.bin.sha256 ]; then
+              gh release upload cn-rules-s3 "$asset" --clobber
+            fi
+          done
+          gh release upload cn-rules-s3 dist-s3/blocklist.bin.sha256 --clobber
+      - name: Show the S3 update URL and manifest
+        env:
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          echo "S3 URL: https://gh-proxy.org/https://github.com/$GH_REPO/releases/download/cn-rules-s3/blocklist.bin" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Legacy cn-rules remains anti-AD only. Both strong sources are required.' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          cat dist-s3/manifest.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
